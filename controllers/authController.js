@@ -132,9 +132,9 @@ export async function googleAuthStart(_req, res) {
 }
 
 // GET /auth/google/callback
-export async function googleAuthCallback(req, res) {
-  try {
-    const { code, state, error } = req.query;
+export async funct    const msg = err?.message || 'Failed to start Google authentication.';
+    return res.redirect(`${env.CLIENT_URL}/auth?error=${encodeURIComponent(msg)}`);
+= req.query;
 
     if (error) {
       return res.redirect(`${env.CLIENT_URL}/auth?error=${encodeURIComponent(String(error))}`);

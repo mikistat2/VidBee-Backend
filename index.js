@@ -42,8 +42,20 @@ app.use(express.json({ limit: '10mb' }));
 // Parse URL-encoded bodies
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// CORS — allow the Vite dev server and any configured client URL
-const allowedOrigins = [env.CLIENT_URL, "http://localhost:5173", "http://localhost:4173"];
+// CORS — allow the Vite dev server and any configured client URL(s)
+// Set CLIENT_URL as a single origin or a comma-separated list of origins.
+const configuredClientOrigins = String(env.CLIENT_URL || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const allowedOrigins = Array.from(
+  new Set([
+    ...configuredClientOrigins,
+    "http://localhost:5173",
+    "http://localhost:4173",
+  ])
+);
 app.use(
   cors({
     origin: function (origin, callback) {
