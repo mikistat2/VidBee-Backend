@@ -7,7 +7,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.resolve(__dirname, "../.env") });
 
-const envconst detectedProduction =
+const detectedProduction =
     process.env.NODE_ENV === "production" ||
     Boolean(process.env.RENDER) ||
     Boolean(process.env.RENDER_EXTERNAL_URL);
@@ -23,13 +23,18 @@ const env = {
     PORT: process.env.PORT || 5000,
     NODE_ENV: nodeEnv,
 
-    // Database
+    // Database (local)
     DB_HOST: process.env.DB_HOST || "localhost",
     DB_PORT: process.env.DB_PORT || 5432,
     DB_USER: process.env.DB_USER || "postgres",
     DB_PASSWORD: process.env.DB_PASSWORD || "",
     DB_NAME: process.env.DB_NAME || "vidbee",
-    // Neon/productiCRET: process.env.JWT_SECRET || "",
+
+    // Database (Neon / production)
+    DATABASE_URL: process.env.DATABASE_URL,
+
+    // JWT
+    JWT_SECRET: process.env.JWT_SECRET || "",
     JWT_EXPIRES_IN: process.env.JWT_EXPIRES_IN || "7d",
 
     // Gemini AI
@@ -39,8 +44,11 @@ const env = {
     // Google OAuth
     GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID,
     GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET,
-    // Must match what you set in Google Cloud Console
-    GOOGLE_CALLBACK_URL: process.env.GOOGLE_CALLBACK_URL || (renderExternalUrl ? `${renderExternalUrl}/auth/google/callback` : "http://localhost:5000/auth/google/callback"),
+    GOOGLE_CALLBACK_URL:
+        process.env.GOOGLE_CALLBACK_URL ||
+        (renderExternalUrl
+            ? `${renderExternalUrl}/auth/google/callback`
+            : "http://localhost:5000/auth/google/callback"),
 
     // Client URL (for CORS)
     CLIENT_URL: process.env.CLIENT_URL || (nodeEnv === "development" ? "http://localhost:5173" : ""),
@@ -53,6 +61,14 @@ function isValidHttpUrl(value) {
     } catch {
         return false;
     }
+}
+
+function hasLocalDbConfig(e) {
+    return Boolean(e.DB_HOST && e.DB_USER && e.DB_NAME);
+}
+
+function hasDatabaseUrl(e) {
+    return Boolean(e.DATABASE_URL);
 }
 
 // Validate URLs to prevent silent misconfig (common with copy/paste mistakes in .env)
@@ -78,31 +94,40 @@ if (env.GOOGLE_CALLBACK_URL && !isValidHttpUrl(env.GOOGLE_CALLBACK_URL)) {
     }
 }
 
-// Check all required variables are present at startup
-const requiredVars = ["DB_HOST", "DB_USER", "DB_NAME", "JWT_SECRET"];
-
-if (env.NODE_ENV === "production") {
-    requiredVars.push("CLIENT_URL");
+// Required variables
+if (!env.JWT_SECRET) {
+    console.error("❌ Missing required environment variable: JWT_SECRET");
+    process.exit(1);
 }
 
-for (const var_ of requiredVars) {
-    if (!env[var_]) {
-        console.error(`❌ Missing required environment variable: ${var_}`);
-        process.exit(1); // Crash early so you know immediately what's missing
-    }
+if (env.NODE_ENV === "production" && !env.CLIENT_URL) {
+    console.error("❌ Missing required environment variable: CLIENT_URL");
+    process.exit(1);
+}
+
+if (!hasDatabaseUrl(env) && !hasLocalDbConfig(env)) {
+    console.error(
+        "❌ Database config missing. Set DATABASE_URL (Neon/production) or DB_HOST/DB_USER/DB_NAME (local)."
+    );
+    process.exit(1);
 }
 
 if (env.NODE_ENV === "production") {
     if (typeof env.JWT_SECRET !== "string" || env.JWT_SECRET.length < 32) {
         console.error("❌ JWT_SECRET must be set and at least 32 characters long in production.");
         process.exit(1);
-important vars
+    }
+}
+
+// Warn (don't crash) for optional-but-important vars
 if (!env.GEMINI_API_KEY) {
     console.warn("⚠️  GEMINI_API_KEY not set — AI quiz generation will fail.");
 }
 
 if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
-    console.warn("⚠️  Google OAuth not set — 'Continue with Google' will be disabled until GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET are configured.");
+    console.warn(
+        "⚠️  Google OAuth not set — 'Continue with Google' will be disabled until GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET are configured."
+    );
 }
 
 export default env;
