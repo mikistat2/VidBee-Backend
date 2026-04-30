@@ -54,16 +54,22 @@ const allowedOrigins = Array.from(
     ...configuredClientOrigins,
     "http://localhost:5173",
     "http://localhost:4173",
-    "http://localhost",          // Capacitor Android
-    "capacitor://localhost",     // Capacitor iOS
+    // ─── Capacitor / Android WebView origins ─────────────────────────
+    // Capacitor v3+ sends this origin from the Android WebView
+    "capacitor://localhost",
+    // Capacitor v2 / fallback
+    "http://localhost",
   ])
 );
 app.use(
   cors({
     origin: function (origin, callback) {
+      // Allow requests with no Origin header (e.g. native mobile, curl, Postman)
+      // AND any explicitly listed origin.
       if (!origin || allowedOrigins.includes(origin)) {
         callback(null, true);
       } else {
+        logger.warn(`CORS blocked origin: ${origin}`);
         callback(new Error("Not allowed by CORS"));
       }
     },
