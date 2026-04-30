@@ -54,6 +54,8 @@ const allowedOrigins = Array.from(
     ...configuredClientOrigins,
     "http://localhost:5173",
     "http://localhost:4173",
+    "http://localhost",          // Capacitor Android
+    "capacitor://localhost",     // Capacitor iOS
   ])
 );
 app.use(
