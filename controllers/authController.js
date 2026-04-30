@@ -106,52 +106,6 @@ export async function getMe(req, res) {
   }
 }
 
-// ─── POST /api/auth/google/token (native mobile Google sign-in) ─────────────
-export async function googleNativeToken(req, res) {
-  try {
-    const { idToken } = req.body;
-
-    if (!idToken) {
-      return res.status(400).json({ error: "Missing idToken." });
-    }
-
-    if (!env.GOOGLE_CLIENT_ID) {
-      return res.status(501).json({ error: "Google OAuth is not configured on this server." });
-    }
-
-    const { OAuth2Client } = await import("google-auth-library");
-    const client = new OAuth2Client(env.GOOGLE_CLIENT_ID);
-
-    const ticket = await client.verifyIdToken({
-      idToken,
-      audience: env.GOOGLE_CLIENT_ID,
-    });
-
-    const payload = ticket.getPayload();
-    const email = payload?.email;
-
-    if (!email) {
-      return res.status(400).json({ error: "Google account has no email." });
-    }
-
-    const firstName = payload?.given_name || email.split("@")[0] || "User";
-    const lastName = payload?.family_name || "Google";
-
-    let user = await findUserByEmail(email);
-    if (!user) {
-      const randomPassword = crypto.randomBytes(32).toString("hex");
-      const hashed = await bcrypt.hash(randomPassword, saltRound);
-      user = await createUser({ firstName, lastName, email, password: hashed });
-    }
-
-    const token = signToken(user);
-    return res.json({ token, user: safeUser(user) });
-  } catch (err) {
-    console.error("Google native token error:", err);
-    return res.status(401).json({ error: "Invalid Google token." });
-  }
-}
-
 // ─── Google OAuth helpers ───────────────────────────────────────────────────
 // In-memory state store with TTL for CSRF protection
 const oauthState = new Map();
@@ -169,6 +123,46 @@ function getOAuthClient() {
     env.GOOGLE_CLIENT_SECRET,
     env.GOOGLE_CALLBACK_URL
   );
+}
+
+// ─── POST /api/auth/google/token ─────────────────────────────────────────────
+export async function googleTokenLogin(req, res) {
+  try {
+    const { idToken } = req.body;
+    if (!idToken) {
+      return res.status(400).json({ error: "idToken is required" });
+    }
+
+    const client = getOAuthClient();
+    const ticket = await client.verifyIdToken({
+      idToken,
+      audience: env.GOOGLE_CLIENT_ID,
+    });
+
+    const payload = ticket.getPayload();
+    const email = payload?.email;
+
+    if (!email) {
+      return res.status(400).json({ error: "Google account has no email" });
+    }
+
+    const firstName = payload?.given_name || email.split("@")[0] || "User";
+    const lastName = payload?.family_name || "Google";
+
+    let user = await findUserByEmail(email);
+    if (!user) {
+      const randomPassword = crypto.randomBytes(32).toString("hex");
+      const hashed = await bcrypt.hash(randomPassword, saltRound);
+      user = await createUser({ firstName, lastName, email, password: hashed });
+    }
+
+    const token = signToken(user);
+
+    return res.status(200).json({ token, user: safeUser(user) });
+  } catch (err) {
+    console.error("Google token login error:", err);
+    return res.status(500).json({ error: "Google login failed." });
+  }
 }
 
 // ─── GET /auth/google ───────────────────────────────────────────────────────
