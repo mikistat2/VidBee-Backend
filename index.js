@@ -57,8 +57,9 @@ const allowedOrigins = Array.from(
     // ─── Capacitor / Android WebView origins ─────────────────────────
     // Capacitor v3+ sends this origin from the Android WebView
     "capacitor://localhost",
-    // Capacitor v2 / fallback
+    // Capacitor v2 / fallback / https scheme
     "http://localhost",
+    "https://localhost",
   ])
 );
 app.use(
