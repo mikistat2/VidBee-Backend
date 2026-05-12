@@ -37,6 +37,17 @@ function mapSessionPayload(session) {
   };
 }
 
+async function getSharedSessionByKey(key) {
+  const byToken = await getSessionByShareToken(key);
+  if (byToken) return byToken;
+
+  if (/^\d+$/.test(String(key))) {
+    return getSessionById(Number(key));
+  }
+
+  return null;
+}
+
 async function buildQuizResponse(session, { publicView = false } = {}) {
   const fullQuestions = await getQuestionsByUpload(session.upload_id, session.config?.difficulty);
   const questions = fullQuestions.map((q) => ({
@@ -172,7 +183,7 @@ export async function generateQuiz(req, res) {
 // Creates or reuses a personal session for the current user from a shared link
 export async function joinSharedSession(req, res) {
   try {
-    const sourceSession = await getSessionByShareToken(req.params.token);
+    const sourceSession = await getSharedSessionByKey(req.params.token);
     if (!sourceSession) {
       return res.status(404).json({ error: 'Session not found.' });
     }
@@ -211,7 +222,7 @@ export async function joinSharedSession(req, res) {
 // Returns a shared session + questions without requiring login
 export async function getSharedSession(req, res) {
   try {
-    const session = await getSessionByShareToken(req.params.token);
+    const session = await getSharedSessionByKey(req.params.token);
     if (!session) {
       return res.status(404).json({ error: 'Session not found.' });
     }
@@ -248,7 +259,7 @@ export async function getSession(req, res) {
 // Returns shared results without requiring login
 export async function getSharedResults(req, res) {
   try {
-    const session = await getSessionByShareToken(req.params.token);
+    const session = await getSharedSessionByKey(req.params.token);
     if (!session) {
       return res.status(404).json({ error: 'Session not found.' });
     }
