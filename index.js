@@ -106,6 +106,20 @@ db.query("SELECT NOW()")
     logger.info("✅ Connected to PostgreSQL");
     return db.query("ALTER TABLE questions ADD COLUMN IF NOT EXISTS explanation JSONB;");
   })
+  .then(() => db.query(`
+    CREATE TABLE IF NOT EXISTS shared_quizzes (
+      id            SERIAL PRIMARY KEY,
+      token         VARCHAR(80)  NOT NULL UNIQUE,
+      owner_user_id INTEGER      REFERENCES users(id) ON DELETE SET NULL,
+      upload_id     INTEGER      NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
+      config        JSONB        NOT NULL DEFAULT '{}',
+      question_ids  INTEGER[]    NOT NULL,
+      option_seed   VARCHAR(80)  NOT NULL,
+      created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    );
+  `))
+  .then(() => db.query("ALTER TABLE quiz_sessions ADD COLUMN IF NOT EXISTS shared_quiz_id INTEGER REFERENCES shared_quizzes(id) ON DELETE SET NULL;"))
+  .then(() => db.query("CREATE INDEX IF NOT EXISTS idx_sessions_shared_quiz ON quiz_sessions(shared_quiz_id);"))
   .then(() => db.query("ALTER TABLE quiz_sessions ADD COLUMN IF NOT EXISTS share_token VARCHAR(80);") )
   .then(() => db.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_share_token ON quiz_sessions(share_token);") )
   .then(() => db.query(`

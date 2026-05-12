@@ -1,6 +1,6 @@
 // Quiz routes
 import { Router } from 'express';
-import { generateQuiz, getSession, getSharedSession, joinSharedSession, submitAnswer, submitSharedAnswer, getResults, getSharedResults, getHistory } from '../controllers/quizController.js';
+import { createShareForSession, generateQuiz, getSession, getSharedSession, joinSharedSession, submitAnswer, submitSharedAnswer, getResults, getSharedResults, getHistory } from '../controllers/quizController.js';
 import authenticate from '../middleware/auth.js';
 
 const router = Router();
@@ -20,6 +20,9 @@ router.post('/generate', generateQuiz);
 
 // GET /api/quiz/session/:id — get session + questions for quiz-taking
 router.get('/session/:id', getSession);
+
+// POST /api/quiz/session/:id/share — create a secure share token pinned to this session's questions
+router.post('/session/:id/share', createShareForSession);
 
 // POST /api/quiz/answer — submit a single answer
 router.post('/answer', submitAnswer);

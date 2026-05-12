@@ -46,10 +46,23 @@ CREATE INDEX IF NOT EXISTS idx_questions_upload ON questions(upload_id);
 ALTER TABLE questions ADD COLUMN IF NOT EXISTS explanation JSONB;
 
 -- ─── Quiz Sessions ─────────────────────────────────────────────────────────
+-- Shared quizzes (templates) — a stable, shareable question set
+CREATE TABLE IF NOT EXISTS shared_quizzes (
+  id            SERIAL PRIMARY KEY,
+  token         VARCHAR(80)  NOT NULL UNIQUE,
+  owner_user_id INTEGER      REFERENCES users(id) ON DELETE SET NULL,
+  upload_id     INTEGER      NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
+  config        JSONB        NOT NULL DEFAULT '{}',
+  question_ids  INTEGER[]    NOT NULL,
+  option_seed   VARCHAR(80)  NOT NULL,
+  created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS quiz_sessions (
   id            SERIAL PRIMARY KEY,
   user_id       INTEGER       NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   upload_id     INTEGER       NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
+  shared_quiz_id INTEGER       REFERENCES shared_quizzes(id) ON DELETE SET NULL,
   config        JSONB         NOT NULL DEFAULT '{}',
   share_token   VARCHAR(80),
   score         INTEGER,
@@ -57,6 +70,7 @@ CREATE TABLE IF NOT EXISTS quiz_sessions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON quiz_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_shared_quiz ON quiz_sessions(shared_quiz_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_share_token ON quiz_sessions(share_token);
 
 -- ─── Answers ────────────────────────────────────────────────────────────────

@@ -118,3 +118,17 @@ function parseQuestion(row) {
     explanation,
   };
 }
+
+// Get multiple questions by a list of ids (order not guaranteed)
+export async function getQuestionsByIds(ids) {
+  if (!Array.isArray(ids) || ids.length === 0) return [];
+
+  const result = await db.query(
+    `SELECT id, upload_id, user_id, question, options, answer, explanation, difficulty, created_at
+     FROM questions
+     WHERE id = ANY($1::int[])`,
+    [ids]
+  );
+
+  return result.rows.map(parseQuestion);
+}

@@ -1,10 +1,11 @@
 // Handles quiz generation, sessions, answers, results, and history
 
-import { randomUUID } from 'crypto';
+import { randomBytes, randomUUID } from 'crypto';
 import { getUploadById } from '../models/Upload.js';
-import { getQuestionsByUpload } from '../models/Question.js';
+import { getQuestionsByIds, getQuestionsByUpload } from '../models/Question.js';
 import { createManyQuestions } from '../models/Question.js';
-import { createSession, getSessionById, getSessionByShareToken, getSessionByUserAndShareSeed, getSessionsByUser, updateSessionScore } from '../models/QuizSession.js';
+import { createSession, getSessionById, getSessionByShareToken, getSessionByUserAndSharedQuizId, getSessionsByUser, updateSessionScore, updateSessionSharedQuiz } from '../models/QuizSession.js';
+import { createSharedQuiz, getSharedQuizById, getSharedQuizByToken } from '../models/SharedQuiz.js';
 import { saveAnswer, getAnswersBySession } from '../models/Answer.js';
 import { generateQuestions } from '../utils/quizGenerator.js';
 import logger from '../utils/logger.js';
@@ -34,44 +35,94 @@ function mapSessionPayload(session) {
     upload_name: session.upload_name,
     config:      session.config,
     share_token: session.share_token,
+    shared_quiz_token: session.shared_quiz_token ?? null,
   };
 }
 
-async function getSharedSessionByKey(key) {
-  const byToken = await getSessionByShareToken(key);
-  if (byToken) return byToken;
+function generateShareToken() {
+  // Non-guessable, URL-safe token
+  return randomBytes(18).toString('base64url');
+}
 
-  if (/^\d+$/.test(String(key))) {
-    return getSessionById(Number(key));
-  }
+async function resolveSharedQuizOrLegacySession(token) {
+  const sharedQuiz = await getSharedQuizByToken(token);
+  if (sharedQuiz) return { type: 'shared_quiz', sharedQuiz };
+
+  // Backward-compat: allow old links that used session.share_token (still non-guessable)
+  const legacySession = await getSessionByShareToken(token);
+  if (legacySession) return { type: 'legacy_session', session: legacySession };
 
   return null;
 }
 
-async function buildQuizResponse(session, { publicView = false } = {}) {
-  const fullQuestions = await getQuestionsByUpload(session.upload_id, session.config?.difficulty);
-  const questions = fullQuestions.map((q) => ({
+async function buildQuestionsFromIds(questionIds, optionSeed) {
+  const rows = await getQuestionsByIds(questionIds);
+  const byId = new Map(rows.map((q) => [Number(q.id), q]));
+  const ordered = questionIds.map((id) => byId.get(Number(id))).filter(Boolean);
+
+  return ordered.map((q) => ({
     id:             q.id,
     question:       q.question,
-    options:        q.options,
+    options:        Array.isArray(q.options) ? shuffleWithSeed(q.options, `${optionSeed}:${q.id}`) : q.options,
     correct_answer: q.answer,
     difficulty:     q.difficulty,
     explanation:    q.explanation || null,
   }));
+}
 
-  const count = session.config?.questionCount || questions.length;
-  const slicedQuestions = questions.slice(0, count);
-  const seededQuestions = slicedQuestions.map((q) => ({
-    ...q,
-    options: Array.isArray(q.options) ? shuffleWithSeed(q.options, `${session.config?.shareSeed || session.id}:${q.id}`) : q.options,
-  }));
+async function buildQuizResponse(session, { publicView = false } = {}) {
+  let questions;
 
-  const answers = publicView ? await getAnswersBySession(session.id) : await getAnswersBySession(session.id);
+  if (session.shared_quiz_id) {
+    const sharedQuiz = await getSharedQuizById(session.shared_quiz_id);
+    if (!sharedQuiz) {
+      questions = [];
+    } else {
+      questions = await buildQuestionsFromIds(sharedQuiz.question_ids, sharedQuiz.option_seed);
+    }
+  } else {
+    // Legacy behavior (sessions not linked to a shared quiz template)
+    const fullQuestions = await getQuestionsByUpload(session.upload_id, session.config?.difficulty);
+    const mapped = fullQuestions.map((q) => ({
+      id:             q.id,
+      question:       q.question,
+      options:        q.options,
+      correct_answer: q.answer,
+      difficulty:     q.difficulty,
+      explanation:    q.explanation || null,
+    }));
+
+    const count = session.config?.questionCount || mapped.length;
+    const slicedQuestions = mapped.slice(0, count);
+    questions = slicedQuestions.map((q) => ({
+      ...q,
+      options: Array.isArray(q.options) ? shuffleWithSeed(q.options, `${session.config?.shareSeed || session.id}:${q.id}`) : q.options,
+    }));
+  }
+
+  const answers = session.id ? await getAnswersBySession(session.id) : [];
 
   return {
     session: mapSessionPayload(session),
-    questions: seededQuestions,
+    questions,
     answers,
+  };
+}
+
+async function buildSharedQuizResponse(sharedQuiz) {
+  const upload = await getUploadById(sharedQuiz.upload_id);
+  const questions = await buildQuestionsFromIds(sharedQuiz.question_ids, sharedQuiz.option_seed);
+  return {
+    session: {
+      id: null,
+      upload_id: sharedQuiz.upload_id,
+      upload_name: upload?.file_name ?? 'Shared quiz',
+      config: sharedQuiz.config,
+      share_token: null,
+      shared_quiz_token: sharedQuiz.token,
+    },
+    questions,
+    answers: [],
   };
 }
 
@@ -158,20 +209,34 @@ export async function generateQuiz(req, res) {
 
     // Set the configured count to not exceed what we actually have
     const finalQuestionCount = Math.min(questionCount, existingQuestions.length);
-    const shareSeed = randomUUID();
-    const shareToken = randomUUID();
+    const optionSeed = randomUUID();
+    const sharedToken = generateShareToken();
+
+    const selectedQuestionIds = existingQuestions
+      .slice(0, finalQuestionCount)
+      .map((q) => q.id);
+
+    const sharedQuiz = await createSharedQuiz({
+      token: sharedToken,
+      ownerUserId: req.user.id,
+      uploadId: upload.id,
+      config: { questionCount: finalQuestionCount, difficulty, answerMode },
+      questionIds: selectedQuestionIds,
+      optionSeed,
+    });
 
     // Create a quiz session
     const session = await createSession({
       userId:   req.user.id,
       uploadId: upload.id,
-      config:   { questionCount: finalQuestionCount, difficulty, answerMode, shareSeed },
-      shareToken,
+      sharedQuizId: sharedQuiz.id,
+      config:   { questionCount: finalQuestionCount, difficulty, answerMode, shareSeed: optionSeed },
+      shareToken: null,
     });
 
     logger.info(`Quiz session ${session.id} created — user: ${req.user.id}, upload: ${uploadId}`);
 
-    res.status(201).json({ sessionId: session.id, shareToken: session.share_token });
+    res.status(201).json({ sessionId: session.id, shareToken: sharedQuiz.token });
 
   } catch (err) {
     logger.error('Quiz generation failed:', err);
@@ -183,35 +248,67 @@ export async function generateQuiz(req, res) {
 // Creates or reuses a personal session for the current user from a shared link
 export async function joinSharedSession(req, res) {
   try {
-    const sourceSession = await getSharedSessionByKey(req.params.token);
-    if (!sourceSession) {
-      return res.status(404).json({ error: 'Session not found.' });
+    const resolved = await resolveSharedQuizOrLegacySession(req.params.token);
+    if (!resolved) {
+      return res.status(404).json({ error: 'Shared quiz not found.' });
     }
 
-    const shareSeed = sourceSession.config?.shareSeed || sourceSession.share_token || req.params.token;
+    // New flow: shared quiz template
+    if (resolved.type === 'shared_quiz') {
+      const sharedQuiz = resolved.sharedQuiz;
 
+      const existing = await getSessionByUserAndSharedQuizId(req.user.id, sharedQuiz.id);
+      if (existing) {
+        return res.json({ sessionId: existing.id, shareToken: sharedQuiz.token });
+      }
+
+      const created = await createSession({
+        userId: req.user.id,
+        uploadId: sharedQuiz.upload_id,
+        sharedQuizId: sharedQuiz.id,
+        config: { ...sharedQuiz.config, shareSeed: sharedQuiz.option_seed },
+        shareToken: null,
+      });
+
+      logger.info(`Shared quiz template ${sharedQuiz.id} joined by user ${req.user.id} as session ${created.id}`);
+      return res.status(201).json({ sessionId: created.id, shareToken: sharedQuiz.token });
+    }
+
+    // Backward-compat: old shared links point to a session token
+    const sourceSession = resolved.session;
     if (sourceSession.user_id === req.user.id) {
       return res.json({ sessionId: sourceSession.id, shareToken: sourceSession.share_token });
     }
 
-    const existingClone = await getSessionByUserAndShareSeed(req.user.id, shareSeed);
-    if (existingClone) {
-      return res.json({ sessionId: existingClone.id, shareToken: existingClone.share_token });
+    const shareSeed = sourceSession.config?.shareSeed || sourceSession.share_token;
+
+    // If source session is already linked to a shared quiz, join by that
+    if (sourceSession.shared_quiz_id) {
+      const existing = await getSessionByUserAndSharedQuizId(req.user.id, sourceSession.shared_quiz_id);
+      if (existing) {
+        return res.json({ sessionId: existing.id, shareToken: sourceSession.share_token });
+      }
+
+      const created = await createSession({
+        userId: req.user.id,
+        uploadId: sourceSession.upload_id,
+        sharedQuizId: sourceSession.shared_quiz_id,
+        config: { ...sourceSession.config, shareSeed },
+        shareToken: null,
+      });
+      return res.status(201).json({ sessionId: created.id, shareToken: sourceSession.share_token });
     }
 
+    // Fall back to cloning legacy session
     const clone = await createSession({
       userId: req.user.id,
       uploadId: sourceSession.upload_id,
-      config: {
-        ...sourceSession.config,
-        shareSeed,
-      },
+      config: { ...sourceSession.config, shareSeed },
       shareToken: randomUUID(),
     });
 
-    logger.info(`Shared quiz ${sourceSession.id} joined by user ${req.user.id} as session ${clone.id}`);
-
-    res.status(201).json({ sessionId: clone.id, shareToken: clone.share_token });
+    logger.info(`Legacy shared session ${sourceSession.id} joined by user ${req.user.id} as session ${clone.id}`);
+    return res.status(201).json({ sessionId: clone.id, shareToken: clone.share_token });
   } catch (err) {
     logger.error('Join shared session failed:', err);
     res.status(500).json({ error: 'Failed to join shared session.' });
@@ -222,13 +319,18 @@ export async function joinSharedSession(req, res) {
 // Returns a shared session + questions without requiring login
 export async function getSharedSession(req, res) {
   try {
-    const session = await getSharedSessionByKey(req.params.token);
-    if (!session) {
-      return res.status(404).json({ error: 'Session not found.' });
+    const resolved = await resolveSharedQuizOrLegacySession(req.params.token);
+    if (!resolved) {
+      return res.status(404).json({ error: 'Shared quiz not found.' });
     }
 
-    const payload = await buildQuizResponse(session, { publicView: true });
-    res.json(payload);
+    if (resolved.type === 'shared_quiz') {
+      const payload = await buildSharedQuizResponse(resolved.sharedQuiz);
+      return res.json(payload);
+    }
+
+    const payload = await buildQuizResponse(resolved.session, { publicView: true });
+    return res.json(payload);
   } catch (err) {
     logger.error('Get shared session failed:', err);
     res.status(500).json({ error: 'Failed to load shared quiz session.' });
@@ -259,16 +361,58 @@ export async function getSession(req, res) {
 // Returns shared results without requiring login
 export async function getSharedResults(req, res) {
   try {
-    const session = await getSharedSessionByKey(req.params.token);
-    if (!session) {
-      return res.status(404).json({ error: 'Session not found.' });
+    const resolved = await resolveSharedQuizOrLegacySession(req.params.token);
+    if (!resolved) {
+      return res.status(404).json({ error: 'Shared quiz not found.' });
     }
 
-    const payload = await getResultsPayload(session);
-    res.json(payload);
+    if (resolved.type === 'shared_quiz') {
+      return res.status(400).json({ error: 'Results are per-user. Join the quiz to see your results.' });
+    }
+
+    const payload = await getResultsPayload(resolved.session);
+    return res.json(payload);
   } catch (err) {
     logger.error('Get shared results failed:', err);
     res.status(500).json({ error: 'Failed to load shared results.' });
+  }
+}
+
+// ─── POST /api/quiz/session/:id/share ───────────────────────────────────────
+// Creates a shared quiz template for an existing session (secure token)
+export async function createShareForSession(req, res) {
+  try {
+    const session = await getSessionById(req.params.id);
+    if (!session) return res.status(404).json({ error: 'Session not found.' });
+    if (session.user_id !== req.user.id) return res.status(403).json({ error: 'Access denied.' });
+
+    if (session.shared_quiz_token) {
+      return res.json({ shareToken: session.shared_quiz_token });
+    }
+
+    const difficulty = session.config?.difficulty ?? null;
+    const fullQuestions = await getQuestionsByUpload(session.upload_id, difficulty);
+    const count = session.config?.questionCount || fullQuestions.length;
+    const questionIds = fullQuestions.slice(0, count).map((q) => q.id);
+
+    const optionSeed = session.config?.shareSeed || randomUUID();
+    const token = generateShareToken();
+
+    const sharedQuiz = await createSharedQuiz({
+      token,
+      ownerUserId: req.user.id,
+      uploadId: session.upload_id,
+      config: { ...session.config, shareSeed: undefined },
+      questionIds,
+      optionSeed,
+    });
+
+    await updateSessionSharedQuiz(session.id, sharedQuiz.id);
+
+    return res.status(201).json({ shareToken: sharedQuiz.token });
+  } catch (err) {
+    logger.error('Create share for session failed:', err);
+    return res.status(500).json({ error: 'Failed to create share link.' });
   }
 }
 
@@ -397,20 +541,28 @@ export async function getResults(req, res) {
 }
 
 async function getResultsPayload(session) {
-  const questions = await getQuestionsByUpload(session.upload_id, session.config?.difficulty);
   const answers = await getAnswersBySession(session.id);
+  const optionSeed = session.config?.shareSeed || session.id;
 
-  const count = session.config?.questionCount || questions.length;
-  const slicedQuestions = questions.slice(0, count);
-
-  const questionsWithAnswers = slicedQuestions.map((q) => ({
-    id:             q.id,
-    question:       q.question,
-    options:        Array.isArray(q.options) ? shuffleWithSeed(q.options, `${session.id}:${q.id}`) : q.options,
-    correct_answer: q.answer,
-    difficulty:     q.difficulty,
-    explanation:    q.explanation || null,
-  }));
+  let questionsWithAnswers;
+  if (session.shared_quiz_id) {
+    const sharedQuiz = await getSharedQuizById(session.shared_quiz_id);
+    questionsWithAnswers = sharedQuiz
+      ? await buildQuestionsFromIds(sharedQuiz.question_ids, sharedQuiz.option_seed)
+      : [];
+  } else {
+    const questions = await getQuestionsByUpload(session.upload_id, session.config?.difficulty);
+    const count = session.config?.questionCount || questions.length;
+    const slicedQuestions = questions.slice(0, count);
+    questionsWithAnswers = slicedQuestions.map((q) => ({
+      id:             q.id,
+      question:       q.question,
+      options:        Array.isArray(q.options) ? shuffleWithSeed(q.options, `${optionSeed}:${q.id}`) : q.options,
+      correct_answer: q.answer,
+      difficulty:     q.difficulty,
+      explanation:    q.explanation || null,
+    }));
+  }
 
   return {
     session: {
@@ -419,6 +571,7 @@ async function getResultsPayload(session) {
       upload_name: session.upload_name,
       score:       session.score,
       share_token: session.share_token,
+      shared_quiz_token: session.shared_quiz_token ?? null,
       config:      session.config,
     },
     questions: questionsWithAnswers,
