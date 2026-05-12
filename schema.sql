@@ -51,11 +51,13 @@ CREATE TABLE IF NOT EXISTS quiz_sessions (
   user_id       INTEGER       NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   upload_id     INTEGER       NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
   config        JSONB         NOT NULL DEFAULT '{}',
+  share_token   VARCHAR(80),
   score         INTEGER,
   created_at    TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON quiz_sessions(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_share_token ON quiz_sessions(share_token);
 
 -- ─── Answers ────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS answers (
@@ -68,3 +70,4 @@ CREATE TABLE IF NOT EXISTS answers (
 );
 
 CREATE INDEX IF NOT EXISTS idx_answers_session ON answers(session_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_answers_session_question ON answers(session_id, question_id);

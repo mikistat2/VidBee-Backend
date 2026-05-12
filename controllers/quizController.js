@@ -1,14 +1,68 @@
 // Handles quiz generation, sessions, answers, results, and history
 
+import { randomUUID } from 'crypto';
 import { getUploadById } from '../models/Upload.js';
-import { getQuestionsByUpload, getQuizQuestions } from '../models/Question.js';
+import { getQuestionsByUpload } from '../models/Question.js';
 import { createManyQuestions } from '../models/Question.js';
-import { createSession, getSessionById, getSessionsByUser, updateSessionScore } from '../models/QuizSession.js';
+import { createSession, getSessionById, getSessionByShareToken, getSessionByUserAndShareSeed, getSessionsByUser, updateSessionScore } from '../models/QuizSession.js';
 import { saveAnswer, getAnswersBySession } from '../models/Answer.js';
 import { generateQuestions } from '../utils/quizGenerator.js';
 import logger from '../utils/logger.js';
 
 const MAX_TEXT_LENGTH = 50_000; // cap prompt size to control cost/latency
+
+function shuffleWithSeed(items, seed) {
+  const shuffled = [...items];
+  let state = 0;
+  for (let i = 0; i < seed.length; i += 1) {
+    state = (state * 31 + seed.charCodeAt(i)) >>> 0;
+  }
+
+  for (let i = shuffled.length - 1; i > 0; i -= 1) {
+    state = (state * 1664525 + 1013904223) >>> 0;
+    const j = state % (i + 1);
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+
+  return shuffled;
+}
+
+function mapSessionPayload(session) {
+  return {
+    id:          session.id,
+    upload_id:   session.upload_id,
+    upload_name: session.upload_name,
+    config:      session.config,
+    share_token: session.share_token,
+  };
+}
+
+async function buildQuizResponse(session, { publicView = false } = {}) {
+  const fullQuestions = await getQuestionsByUpload(session.upload_id, session.config?.difficulty);
+  const questions = fullQuestions.map((q) => ({
+    id:             q.id,
+    question:       q.question,
+    options:        q.options,
+    correct_answer: q.answer,
+    difficulty:     q.difficulty,
+    explanation:    q.explanation || null,
+  }));
+
+  const count = session.config?.questionCount || questions.length;
+  const slicedQuestions = questions.slice(0, count);
+  const seededQuestions = slicedQuestions.map((q) => ({
+    ...q,
+    options: Array.isArray(q.options) ? shuffleWithSeed(q.options, `${session.config?.shareSeed || session.id}:${q.id}`) : q.options,
+  }));
+
+  const answers = publicView ? await getAnswersBySession(session.id) : await getAnswersBySession(session.id);
+
+  return {
+    session: mapSessionPayload(session),
+    questions: seededQuestions,
+    answers,
+  };
+}
 
 // ─── POST /api/quiz/generate ───────────────────────────────────────────────────
 // Creates a quiz session: generates questions from the upload's extracted text
@@ -93,21 +147,80 @@ export async function generateQuiz(req, res) {
 
     // Set the configured count to not exceed what we actually have
     const finalQuestionCount = Math.min(questionCount, existingQuestions.length);
+    const shareSeed = randomUUID();
+    const shareToken = randomUUID();
 
     // Create a quiz session
     const session = await createSession({
       userId:   req.user.id,
       uploadId: upload.id,
-      config:   { questionCount: finalQuestionCount, difficulty, answerMode },
+      config:   { questionCount: finalQuestionCount, difficulty, answerMode, shareSeed },
+      shareToken,
     });
 
     logger.info(`Quiz session ${session.id} created — user: ${req.user.id}, upload: ${uploadId}`);
 
-    res.status(201).json({ sessionId: session.id });
+    res.status(201).json({ sessionId: session.id, shareToken: session.share_token });
 
   } catch (err) {
     logger.error('Quiz generation failed:', err);
     res.status(500).json({ error: 'Failed to generate quiz. Please try again.' });
+  }
+}
+
+// ─── POST /api/quiz/share/:token/join ─────────────────────────────────────────
+// Creates or reuses a personal session for the current user from a shared link
+export async function joinSharedSession(req, res) {
+  try {
+    const sourceSession = await getSessionByShareToken(req.params.token);
+    if (!sourceSession) {
+      return res.status(404).json({ error: 'Session not found.' });
+    }
+
+    const shareSeed = sourceSession.config?.shareSeed || sourceSession.share_token || req.params.token;
+
+    if (sourceSession.user_id === req.user.id) {
+      return res.json({ sessionId: sourceSession.id, shareToken: sourceSession.share_token });
+    }
+
+    const existingClone = await getSessionByUserAndShareSeed(req.user.id, shareSeed);
+    if (existingClone) {
+      return res.json({ sessionId: existingClone.id, shareToken: existingClone.share_token });
+    }
+
+    const clone = await createSession({
+      userId: req.user.id,
+      uploadId: sourceSession.upload_id,
+      config: {
+        ...sourceSession.config,
+        shareSeed,
+      },
+      shareToken: randomUUID(),
+    });
+
+    logger.info(`Shared quiz ${sourceSession.id} joined by user ${req.user.id} as session ${clone.id}`);
+
+    res.status(201).json({ sessionId: clone.id, shareToken: clone.share_token });
+  } catch (err) {
+    logger.error('Join shared session failed:', err);
+    res.status(500).json({ error: 'Failed to join shared session.' });
+  }
+}
+
+// ─── GET /api/quiz/share/:token ───────────────────────────────────────────────
+// Returns a shared session + questions without requiring login
+export async function getSharedSession(req, res) {
+  try {
+    const session = await getSessionByShareToken(req.params.token);
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found.' });
+    }
+
+    const payload = await buildQuizResponse(session, { publicView: true });
+    res.json(payload);
+  } catch (err) {
+    logger.error('Get shared session failed:', err);
+    res.status(500).json({ error: 'Failed to load shared quiz session.' });
   }
 }
 
@@ -123,48 +236,28 @@ export async function getSession(req, res) {
       return res.status(403).json({ error: 'Access denied.' });
     }
 
-    const answerMode = session.config?.answerMode || 'immediate';
-
-    // For immediate mode, we need full questions (with correct_answer) so the
-    // client can show instant feedback. For end mode, strip answers for security.
-    let questions;
-    if (answerMode === 'immediate') {
-      const fullQuestions = await getQuestionsByUpload(session.upload_id, session.config?.difficulty);
-      questions = fullQuestions.map((q) => ({
-        id:             q.id,
-        question:       q.question,
-        options:        q.options,
-        correct_answer: q.answer,
-        difficulty:     q.difficulty,
-        explanation:    q.explanation || null,
-      }));
-    } else {
-      questions = await getQuizQuestions(session.upload_id, session.config?.difficulty);
-    }
-
-    // Get the configured question count and slice if needed
-    const count = session.config?.questionCount || questions.length;
-    const slicedQuestions = questions.slice(0, count);
-
-    // Shuffle options to prevent pattern guessing
-    slicedQuestions.forEach(q => {
-      if (Array.isArray(q.options)) {
-        q.options = q.options.sort(() => Math.random() - 0.5);
-      }
-    });
-
-    res.json({
-      session: {
-        id:          session.id,
-        upload_id:   session.upload_id,
-        upload_name: session.upload_name,
-        config:      session.config,
-      },
-      questions: slicedQuestions,
-    });
+    const payload = await buildQuizResponse(session);
+    res.json(payload);
   } catch (err) {
     logger.error('Get session failed:', err);
     res.status(500).json({ error: 'Failed to load quiz session.' });
+  }
+}
+
+// ─── GET /api/quiz/share/:token/results ───────────────────────────────────────
+// Returns shared results without requiring login
+export async function getSharedResults(req, res) {
+  try {
+    const session = await getSessionByShareToken(req.params.token);
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found.' });
+    }
+
+    const payload = await getResultsPayload(session);
+    res.json(payload);
+  } catch (err) {
+    logger.error('Get shared results failed:', err);
+    res.status(500).json({ error: 'Failed to load shared results.' });
   }
 }
 
@@ -223,6 +316,55 @@ export async function submitAnswer(req, res) {
   }
 }
 
+// ─── POST /api/quiz/share/:token/answer ───────────────────────────────────────
+// Saves a single answer for a shared session
+export async function submitSharedAnswer(req, res) {
+  try {
+    const { token } = req.params;
+    const { questionId, answer: selectedAnswer } = req.body;
+
+    if (!questionId || !selectedAnswer) {
+      return res.status(400).json({ error: 'questionId and answer are required.' });
+    }
+
+    const session = await getSessionByShareToken(token);
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found.' });
+    }
+
+    const questions = await getQuestionsByUpload(session.upload_id);
+    const question = questions.find((q) => q.id === Number(questionId));
+
+    if (!question) {
+      return res.status(404).json({ error: 'Question not found.' });
+    }
+
+    const isCorrect = selectedAnswer === question.answer;
+
+    await saveAnswer({
+      sessionId: session.id,
+      questionId,
+      selectedAnswer,
+      isCorrect,
+    });
+
+    const allAnswers = await getAnswersBySession(session.id);
+    const correctCount = allAnswers.filter((a) => a.is_correct).length;
+    const score = Math.round((correctCount / allAnswers.length) * 100);
+    await updateSessionScore(session.id, score);
+
+    res.json({
+      success: true,
+      is_correct: isCorrect,
+      correct_answer: session.config?.answerMode === 'immediate' ? question.answer : undefined,
+      explanation: session.config?.answerMode === 'immediate' ? question.explanation : undefined,
+    });
+  } catch (err) {
+    logger.error('Submit shared answer failed:', err);
+    res.status(500).json({ error: 'Failed to submit shared answer.' });
+  }
+}
+
 // ─── GET /api/quiz/results/:id ─────────────────────────────────────────────────
 // Returns full results for a completed quiz session
 export async function getResults(req, res) {
@@ -235,41 +377,42 @@ export async function getResults(req, res) {
       return res.status(403).json({ error: 'Access denied.' });
     }
 
-    const questions = await getQuestionsByUpload(session.upload_id, session.config?.difficulty);
-    const answers = await getAnswersBySession(session.id);
-
-    // If they generated less than the total pool, only return the questions they actually saw.
-    // In immediate mode they are ordered by created_at, but we should match what getSession did.
-    // However, if we shuffle in getSession, we only reliably know they saw what they answered
-    // OR just slice the exact same way if we assume deterministic ordering.
-    // For now, let's just slice the same way `getSession` does based on the config.
-    const count = session.config?.questionCount || questions.length;
-    const slicedQuestions = questions.slice(0, count);
-
-    // Map questions to include correct_answer for the results view
-    const questionsWithAnswers = slicedQuestions.map((q) => ({
-      id:             q.id,
-      question:       q.question,
-      options:        q.options,
-      correct_answer: q.answer,
-      difficulty:     q.difficulty,
-      explanation:    q.explanation || null,
-    }));
-
-    res.json({
-      session: {
-        id:          session.id,
-        upload_id:   session.upload_id,
-        upload_name: session.upload_name,
-        score:       session.score,
-      },
-      questions: questionsWithAnswers,
-      answers,
-    });
+    const payload = await getResultsPayload(session);
+    res.json(payload);
   } catch (err) {
     logger.error('Get results failed:', err);
     res.status(500).json({ error: 'Failed to load results.' });
   }
+}
+
+async function getResultsPayload(session) {
+  const questions = await getQuestionsByUpload(session.upload_id, session.config?.difficulty);
+  const answers = await getAnswersBySession(session.id);
+
+  const count = session.config?.questionCount || questions.length;
+  const slicedQuestions = questions.slice(0, count);
+
+  const questionsWithAnswers = slicedQuestions.map((q) => ({
+    id:             q.id,
+    question:       q.question,
+    options:        Array.isArray(q.options) ? shuffleWithSeed(q.options, `${session.id}:${q.id}`) : q.options,
+    correct_answer: q.answer,
+    difficulty:     q.difficulty,
+    explanation:    q.explanation || null,
+  }));
+
+  return {
+    session: {
+      id:          session.id,
+      upload_id:   session.upload_id,
+      upload_name: session.upload_name,
+      score:       session.score,
+      share_token: session.share_token,
+      config:      session.config,
+    },
+    questions: questionsWithAnswers,
+    answers,
+  };
 }
 
 // ─── GET /api/quiz/history ─────────────────────────────────────────────────────

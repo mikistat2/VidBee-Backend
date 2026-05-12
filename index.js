@@ -106,6 +106,16 @@ db.query("SELECT NOW()")
     logger.info("✅ Connected to PostgreSQL");
     return db.query("ALTER TABLE questions ADD COLUMN IF NOT EXISTS explanation JSONB;");
   })
+  .then(() => db.query("ALTER TABLE quiz_sessions ADD COLUMN IF NOT EXISTS share_token VARCHAR(80);") )
+  .then(() => db.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_share_token ON quiz_sessions(share_token);") )
+  .then(() => db.query(`
+    DELETE FROM answers a
+    USING answers b
+    WHERE a.session_id = b.session_id
+      AND a.question_id = b.question_id
+      AND a.id < b.id
+  `))
+  .then(() => db.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_answers_session_question ON answers(session_id, question_id);") )
   .then(() => {
     app.listen(PORT, () => {
       logger.info(`🚀 VidBee server running on http://localhost:${PORT}`);

@@ -8,6 +8,11 @@ export async function saveAnswer({ sessionId, questionId, selectedAnswer, isCorr
   const result = await db.query(
     `INSERT INTO answers (session_id, question_id, selected_answer, is_correct)
      VALUES ($1, $2, $3, $4)
+     ON CONFLICT (session_id, question_id)
+     DO UPDATE SET
+       selected_answer = EXCLUDED.selected_answer,
+       is_correct = EXCLUDED.is_correct,
+       created_at = NOW()
      RETURNING id, session_id, question_id, selected_answer, is_correct, created_at`,
     [sessionId, questionId, selectedAnswer, isCorrect]
   );

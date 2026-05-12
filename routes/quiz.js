@@ -1,12 +1,19 @@
 // Quiz routes
 import { Router } from 'express';
-import { generateQuiz, getSession, submitAnswer, getResults, getHistory } from '../controllers/quizController.js';
+import { generateQuiz, getSession, getSharedSession, joinSharedSession, submitAnswer, submitSharedAnswer, getResults, getSharedResults, getHistory } from '../controllers/quizController.js';
 import authenticate from '../middleware/auth.js';
 
 const router = Router();
 
+// Public share routes — accessible by token without logging in
+router.get('/share/:token', getSharedSession);
+router.get('/share/:token/results', getSharedResults);
+
 // All quiz routes require authentication
 router.use(authenticate);
+
+router.post('/share/:token/join', joinSharedSession);
+router.post('/share/:token/answer', submitSharedAnswer);
 
 // POST /api/quiz/generate — create quiz session + generate questions
 router.post('/generate', generateQuiz);
